@@ -9,10 +9,9 @@ from pydantic import ValidationError
 
 from .schemas import TicketAnalysis
 
-MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash")
-API_KEY = os.getenv("GEMINI_API_KEY", "")
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-TIMEOUT_S = 30.0
+MODEL = os.getenv("LLM_MODEL", "llama3.2")
+API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+TIMEOUT_S = 120.0   # local model එක cloud එකට වඩා සෙමින්
 
 
 SYSTEM_PROMPT = """You are a support ticket triage system.
@@ -61,39 +60,33 @@ def _extract_json(text: str) -> dict:
 
 async def analyse(text: str, subject: str | None = None) -> Tuple[TicketAnalysis, int]:
     """Ticket එකක් analyse කරනවා. (analysis, latency_ms) return කරනවා."""
-    if not API_KEY:
-        raise LLMError("GEMINI_API_KEY is not set")
-
     prompt = f"Subject: {subject}\n\nTicket:\n{text}" if subject else f"Ticket:\n{text}"
     started = time.perf_counter()
 
     request_body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
-        },
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.2},
     }
 
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(
-                API_URL,
-                params={"key": API_KEY},
-                json=request_body,
-                timeout=TIMEOUT_S,
-            )
+            resp = await client.post(API_URL, json=request_body, timeout=TIMEOUT_S)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"LLM returned {exc.response.status_code}: {exc.response.text[:200]}") from exc
         except httpx.RequestError as exc:
-            raise LLMError(f"could not reach LLM: {exc}") from exc
+            raise LLMError(f"could not reach Ollama at {API_URL}: {exc}") from exc
 
     data = resp.json()
     try:
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as exc:
+        raw = data["message"]["content"]
+    except KeyError as exc:
         raise LLMError(f"unexpected response shape: {exc}") from exc
 
     try:
