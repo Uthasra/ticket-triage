@@ -1,4 +1,3 @@
-# app/llm.py
 import json
 import os
 import re
@@ -10,9 +9,9 @@ from pydantic import ValidationError
 
 from .schemas import TicketAnalysis
 
-API_URL = "https://api.anthropic.com/v1/messages"
-MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash")
+API_KEY = os.getenv("GEMINI_API_KEY", "")
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 TIMEOUT_S = 30.0
 
 
@@ -43,10 +42,7 @@ class LLMError(Exception):
 
 
 def _extract_json(text: str) -> dict:
-    """
-    LLM එක සමහර වෙලාවට ```json fence එකක් ඇතුළේ JSON එක දානවා,
-    නැත්තං ඉස්සරහින් වාක්‍යයක් දානවා. ඒවා ඉවත් කරනවා.
-    """
+    """```json fences හෝ අමතර වාක්‍ය ඉවත් කරලා JSON එක ගන්නවා."""
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -56,7 +52,6 @@ def _extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Fallback: පළවෙනි {...} block එක හොයනවා
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         return json.loads(match.group(0))
@@ -67,43 +62,40 @@ def _extract_json(text: str) -> dict:
 async def analyse(text: str, subject: str | None = None) -> Tuple[TicketAnalysis, int]:
     """Ticket එකක් analyse කරනවා. (analysis, latency_ms) return කරනවා."""
     if not API_KEY:
-        raise LLMError("ANTHROPIC_API_KEY is not set")
+        raise LLMError("GEMINI_API_KEY is not set")
 
     prompt = f"Subject: {subject}\n\nTicket:\n{text}" if subject else f"Ticket:\n{text}"
     started = time.perf_counter()
+
+    request_body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
 
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
                 API_URL,
-                headers={
-                    "content-type": "application/json",
-                    "x-api-key": API_KEY,
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": MODEL,
-                    "max_tokens": 1000,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
+                params={"key": API_KEY},
+                json=request_body,
                 timeout=TIMEOUT_S,
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise LLMError(f"LLM returned {exc.response.status_code}") from exc
+            raise LLMError(f"LLM returned {exc.response.status_code}: {exc.response.text[:200]}") from exc
         except httpx.RequestError as exc:
             raise LLMError(f"could not reach LLM: {exc}") from exc
 
-    # Response එකේ text blocks එකතු කරනවා
     data = resp.json()
-    raw = "".join(
-        block.get("text", "")
-        for block in data.get("content", [])
-        if block.get("type") == "text"
-    )
+    try:
+        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        raise LLMError(f"unexpected response shape: {exc}") from exc
 
-    # Parse + validate
     try:
         payload = _extract_json(raw)
         analysis = TicketAnalysis.model_validate(payload)
