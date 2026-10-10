@@ -37,7 +37,7 @@ class TicketAnalysis(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    """අපි return කරන දේ."""
     analysis: TicketAnalysis
     model: str
+    cached: bool = False
     latency_ms: int
