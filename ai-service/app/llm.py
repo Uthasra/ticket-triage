@@ -2,6 +2,8 @@ import json
 import os
 import re
 import time
+import asyncio
+import logging
 from typing import Tuple
 
 import httpx
@@ -58,11 +60,8 @@ def _extract_json(text: str) -> dict:
     raise ValueError("no JSON object found in response")
 
 
-async def analyse(text: str, subject: str | None = None) -> Tuple[TicketAnalysis, int]:
-    """Ticket එකක් analyse කරනවා. (analysis, latency_ms) return කරනවා."""
-    prompt = f"Subject: {subject}\n\nTicket:\n{text}" if subject else f"Ticket:\n{text}"
-    started = time.perf_counter()
-
+async def _call_once(client: httpx.AsyncClient, prompt: str) -> str:
+    """එක HTTP call එකක්. Raw text එක return කරනවා."""
     request_body = {
         "model": MODEL,
         "messages": [
@@ -74,28 +73,60 @@ async def analyse(text: str, subject: str | None = None) -> Tuple[TicketAnalysis
         "options": {"temperature": 0.2},
     }
 
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(API_URL, json=request_body, timeout=TIMEOUT_S)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise LLMError(f"LLM returned {exc.response.status_code}: {exc.response.text[:200]}") from exc
-        except httpx.RequestError as exc:
-            raise LLMError(f"could not reach Ollama at {API_URL}: {exc}") from exc
+    resp = await client.post(API_URL, json=request_body, timeout=TIMEOUT_S)
+    resp.raise_for_status()
 
     data = resp.json()
-    try:
-        raw = data["message"]["content"]
-    except KeyError as exc:
-        raise LLMError(f"unexpected response shape: {exc}") from exc
+    return data["message"]["content"]
 
-    try:
-        payload = _extract_json(raw)
-        analysis = TicketAnalysis.model_validate(payload)
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise LLMError(f"could not parse LLM output: {exc}") from exc
-    except ValidationError as exc:
-        raise LLMError(f"LLM output did not match schema: {exc}") from exc
 
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    return analysis, latency_ms
+async def analyse(text: str, subject: str | None = None) -> Tuple[TicketAnalysis, int]:
+    """
+    Ticket එකක් analyse කරනවා.
+
+    තාවකාලික අවුල් (bad JSON, schema fail, 5xx, 429, network)
+    retry කරනවා. ස්ථිර අවුල් (400, 401, 404) retry කරන්නේ නෑ.
+    """
+    prompt = f"Subject: {subject}\n\nTicket:\n{text}" if subject else f"Ticket:\n{text}"
+    started = time.perf_counter()
+    last_error: Exception | None = None
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                raw = await _call_once(client, prompt)
+                payload = _extract_json(raw)
+                analysis = TicketAnalysis.model_validate(payload)
+
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                if attempt > 1:
+                    logger.info("succeeded on attempt %d", attempt)
+                return analysis, latency_ms
+
+            except (ValidationError, ValueError, json.JSONDecodeError, KeyError) as exc:
+                # Model එක වැරදි shape එකක් දුන්නා. ආයෙ sample කළාම
+                # බොහෝ විට හරියනවා — retry කරන්න වටිනවා.
+                last_error = exc
+                logger.warning("attempt %d: bad output (%s)", attempt, exc)
+
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status = exc.response.status_code
+                if status < 500 and status != 429:
+                    # 4xx (429 හැර) retry එකෙන් හරියන්නේ නෑ.
+                    raise LLMError(f"LLM rejected the request: {status}") from exc
+                logger.warning("attempt %d: HTTP %d", attempt, status)
+
+            except httpx.RequestError as exc:
+                # Network / timeout — තාවකාලික වෙන්න පුළුවන්.
+                last_error = exc
+                logger.warning("attempt %d: network error (%s)", attempt, exc)
+
+            if attempt < MAX_ATTEMPTS:
+                delay = 0.5 * (2 ** (attempt - 1))   # 0.5s, 1s, 2s ...
+                logger.info("retrying in %.1fs", delay)
+                await asyncio.sleep(delay)
+
+    raise LLMError(f"failed after {MAX_ATTEMPTS} attempts: {last_error}")
+
+    
