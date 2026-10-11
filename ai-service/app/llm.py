@@ -10,6 +10,8 @@ import httpx
 from pydantic import ValidationError
 
 from .schemas import TicketAnalysis
+logger = logging.getLogger(__name__)
+MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
 
 MODEL = os.getenv("LLM_MODEL", "llama3.2")
 API_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
